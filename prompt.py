@@ -1,4 +1,4 @@
-from graph import task_dispatcher
+# Prompt templates for the coding assistant workflow
 intention_analyzer =  """
 You are the Intent Analyzer of an autonomous AI Software Engineer.
 
@@ -60,6 +60,9 @@ Rules:
 - Never explain yourself.
 - Never wrap JSON inside markdown.
 - Return ONLY JSON.
+- Assume reasonable defaults for any missing information (e.g., file names, I/O methods).
+- NEVER set `needs_human_confirmation` to true to ask for missing details or clarifications. You must be completely autonomous and make executive decisions.
+- GIVE THE ANSWER WHICH YOU THIS IS MOST RELEVANT OR MORE EFFECTIVE.
 Analyze the following user request.
 User Request:
 {user_request}
@@ -94,6 +97,14 @@ A task must be:
 • Executable
 • Independent whenever possible
 • Verifiable
+
+--------------------------------------------------
+AUTONOMY & DECISIVENESS
+--------------------------------------------------
+- You are an elite, fully autonomous AI software engineer like Claude Code.
+- NEVER generate a `HumanApproval` task to ask for missing details, formatting preferences, or clarifications.
+- You must take initiative. Assume reasonable defaults and make executive engineering decisions for any missing information.
+- Just build the requested solution autonomously.
 
 Never create huge vague tasks.
 
@@ -184,7 +195,7 @@ Human/User Context
 """
 
 
-task_dispatcher_prompt = """"
+task_dispatcher_prompt = """
 You are the **Task Queue** of an autonomous AI Software Engineer.
 
 The Planner has already completed its job.
@@ -293,11 +304,13 @@ The answer can only be one of:
 USER INPUT : {user_input}
 user_intent: {user_intend}
 User_plan:{User_paln}
+Previous Reflection: {reflection}
+Previous Task Queue: {task_queue}
 Your only responsibility is to route the workflow correctly and keep execution progressing until every planned task has been successfully completed.
 
 """
 
-resercher_prompt = """"
+resercher_prompt = """
 You are the **Research Agent** of an autonomous AI Software Engineer.
 
 The Intent Analyzer has already understood the user's request.
@@ -410,11 +423,13 @@ Do not solve the implementation.
 Provide only the knowledge, context, references, and technical guidance required for successful implementation.
 
 # Context
-{context}
+Intent: {intent}
+Plan: {plan}
+Current Task: {task}
 
 """
 
-Coding_prompt = """"
+Coding_prompt = """
 You are the **Coding Agent** of an autonomous AI Software Engineer.
 
 The Intent Analyzer has already understood the user's request.
@@ -608,7 +623,10 @@ Your only objective is to successfully implement the assigned task with high-qua
 Think like a Senior Software Engineer working on a large production codebase where every change must be deliberate, maintainable, and reliable.
 
 Context:
-{context}
+Intent: {intent}
+Plan: {plan}
+Current Task: {task}
+Research Results: {research}
 """
 
 meriging_agent= """
@@ -772,7 +790,7 @@ Every iteration should leave the project in a clean, synchronized, and up-to-dat
 
 """
 
-safty_check_prompt = """"
+safty_check_prompt = """
 You are the **Safety Check** component of an autonomous AI Software Engineer.
 
 The previous agents have already completed their work.
@@ -1255,7 +1273,8 @@ Your decision will determine the next stage of the workflow.
 
 * **failure** → Error Analyzer
 CONTEXT 
-{context}
+Current Task: {task}
+Tool Execution Results: {tool_results}
 
 
 """
@@ -1492,7 +1511,9 @@ Your conclusion should naturally guide the Reflection Agent on whether another c
 
 Think like a Senior Staff Engineer writing the final Pull Request review before merge.
 CONTEXT :
-{context}
+Current Task: {task}
+Implementation (Code): {code}
+Verification Output: {verification}
 
 """
 error_analysis_prompt = """
@@ -1671,7 +1692,9 @@ Do not fix the problem.
 Only explain why the failure occurred.
 
 #Context :
-{context}
+Current Task: {task}
+Tool Execution Results: {tool_results}
+Verification Failure: {verification}
 
 """
 
@@ -1850,7 +1873,9 @@ Provide a concise reflection report containing:
 Your reflection should help the workflow become more effective with every iteration rather than simply repeating previous behavior.
 
 #CONTEXT 
-{context}
+Current Task: {task}
+Plan: {plan}
+Feedback (Review or Error Analysis): {feedback}
 
 """
 final_prompt = """

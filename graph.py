@@ -1,17 +1,28 @@
-from pydantic import BaseModel,Field
-from prompt import planner_prompt
-from typing import TypedDict, Literal, Annotated,Optional
+from pydantic import BaseModel, Field
+from typing import TypedDict, Literal, Annotated, Optional
 from langgraph.graph import StateGraph, START, END
-from langgraph.types import interrupt,Command 
-from langgraph.prebuilt import ToolNode,tools_condition
+from langgraph.graph.message import AnyMessage, add_messages
+from langgraph.types import interrupt, Command 
+from langgraph.prebuilt import ToolNode, tools_condition
 from agenti_main import llm
 from tools import all_tools
 from langgraph.checkpoint.memory import InMemorySaver
 from prompt import *
-# memeory 
+# memory 
 import operator
-# tool bindinding 
+import sys
+import io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+
+def format_prompt(template: str, **kwargs) -> str:
+    result = template
+    for k, v in kwargs.items():
+        result = result.replace(f"{{{k}}}", str(v))
+    return result
+
+# tool binding 
 llm_invoke_tool = llm.bind_tools(all_tools)
+
 class AgentState(TypedDict):
     user_request: str
     intent: dict                 # parsed goal, constraints, success criteria
@@ -21,56 +32,69 @@ class AgentState(TypedDict):
     current_task: Literal['research','coding']
     research_results: Annotated[Optional[list], operator.add] 
     code_changes: Optional[list[dict]] 
-    merging_data : str 
+    merging_data: str 
     safety_flags: Literal['needs_human','execute']
     tool_results: list[dict]
+    messages: Annotated[list[AnyMessage], add_messages]
     verification: Literal["success","failure"]
+    error_analysis: str          # output from error_analyzer node
+    review: str                  # output from review node
     reflection: str
+    retry_local: Optional[bool]  # flag for local retry in reflection
     status: Literal['planning','running','review','done','failed']
-class task_queuesss(BaseModel):
-    task_type = Literal["research","coding"]
-    description : str =Field(...,description="write the task which you want to perform")
 
-pyadntic_output = llm.with_structured_output(task_queuesss)
+class TaskQueue(BaseModel):
+    task_type: Literal["research", "coding"]
+    description: str = Field(..., description="write the task which you want to perform")
+
+pydantic_output = llm.with_structured_output(TaskQueue)
 
 def intent_analyzer(state: AgentState):
-    response = llm.invoke(intent_analyzer(state['user_request']))
-    result =  response.content
+    response = llm.invoke(format_prompt(intention_analyzer, user_request=state['user_request']))
+    result = response.content
     return {"intent": result}
+
 def context_builder(state: AgentState):
      pass
+
 def planner(state: AgentState):
-    response = llm.invoke(planner_prompt(state['intent'],state['user_request']))
-    result =  response.content
+    response = llm.invoke(format_prompt(planner_prompt, intent=state['intent'], context=state['user_request']))
+    result = response.content
     return {"plan": result} 
+
 def task_dispatcher(state: AgentState):
-    response = pyadntic_output.invoke(task_dispatcher_prompt(state['plan'],state['intent'],state['user_request']))
-    result = response.content
-    return {"task_queue": result.description,"current_task":result.task_type} 
+    result = pydantic_output.invoke(format_prompt(task_dispatcher_prompt, 
+        User_paln=state.get('plan', ''), user_intend=state.get('intent', ''), user_input=state.get('user_request', ''),
+        reflection=state.get('reflection', 'None'), task_queue=state.get('task_queue', 'None')))
+    return {"task_queue": result.description, "current_task": result.task_type} 
+
 def research(state: AgentState):
-    response = llm.invoke(resercher_prompt(state["task_queue"]))
+    response = llm.invoke(format_prompt(resercher_prompt, 
+        intent=state.get('intent', ''), plan=state.get('plan', ''), task=state.get('task_queue', '')))
     result = response.content
-    return {"research_results": result}
+    return {"research_results": [result]}  # list because research_results uses operator.add reducer
      
 def coding(state: AgentState):
-    response = llm.invoke(Coding_prompt(state["task_queue"]))
+    response = llm.invoke(format_prompt(Coding_prompt, 
+        intent=state.get('intent', ''), plan=state.get('plan', ''), task=state.get('task_queue', ''), 
+        research=state.get('research_results', '')))
     result = response.content
     return {"code_changes": result}
-def mergin_content(state:AgentState):
+
+def mergin_content(state: AgentState):
     context = {}
-    if state['research_results']:
+    if state.get('research_results'):
         context['research_results'] = state['research_results']
-    if state['code_changes']:
+    if state.get('code_changes'):
         context['code_changes'] = state['code_changes']
 
-    response = llm.invoke(mergin_content(context))
+    response = llm.invoke(format_prompt(meriging_agent, context=context))
     result = response.content
     return {"merging_data": result}
 
 def safety_check(state: AgentState):
-    """Evaluates the merged execution context and decides if human approval is needed.
-    Returns safety_flags: 'execute' (safe) or 'needs_human' (risky)."""
-    response = llm.invoke(safty_check_prompt(state['merging_data']))
+   
+    response = llm.invoke(format_prompt(safty_check_prompt, context=state['merging_data']))
     result = response.content
     return {"safety_flags": result}
     
@@ -100,54 +124,71 @@ def human_checkpoint(state: AgentState):
         return Command(goto="planner")
 
 def tool_executor(state: AgentState):
-    response = llm.invoke(tool_executor_prompt(state['safety_flags']))
-    return {'tool_results':response.content}
+    # Retrieve previous tool messages if we are in a tool loop
+    msgs = state.get('messages', [])
+    sys_msg = format_prompt(tool_executor_prompt, context=state['merging_data'])
+    
+    if not msgs:
+        messages_to_invoke = [("user", sys_msg)]
+    else:
+        # Re-invoke LLM with the context + tool history
+        messages_to_invoke = [("user", sys_msg)] + msgs
+        
+    response = llm_invoke_tool.invoke(messages_to_invoke)
+    
+    # Store a string representation for the verify node
+    history_str = response.content if response.content else str(response.tool_calls)
+    
+    return {'messages': [response], 'tool_results': [{'output': history_str}]}
+
 def verification(state: AgentState):
-     response = llm.invoke(verifcation_prompt(state['tool_results']))
-     return {"verification":response.content}
+     response = llm.invoke(format_prompt(verifcation_prompt, 
+        task=state.get('task_queue', ''), tool_results=state.get('tool_results', '')))
+     return {"verification": response.content}
+
 def error_analyzer(state: AgentState):
-     response = llm.invoke(error_analysis_prompt(state['verification']))
-     return {"error_analysis":response.content}
+     response = llm.invoke(format_prompt(error_analysis_prompt, 
+        task=state.get('task_queue', ''), tool_results=state.get('tool_results', ''), verification=state.get('verification', '')))
+     return {"error_analysis": response.content}
+
 def review(state: AgentState):
-    response = llm.invoke(review_prompt(state['verification']))
+    response = llm.invoke(format_prompt(review_prompt, 
+        task=state.get('task_queue', ''), code=state.get('merging_data', ''), verification=state.get('verification', '')))
     result = response.content
-    return {"review":result} 
+    return {"review": result} 
+
 def reflection(state: AgentState):
-    context = {}
-    if state['review']:
-        context['review'] = state['review']
-    if state['error_analysis']:
-        context['error_analysis'] = state['error_analysis']
-    response = llm.invoke(reflection_prompt(context))
+    feedback = state.get('error_analysis') if state.get('verification') == 'failure' else state.get('review')
+    response = llm.invoke(format_prompt(reflection_prompt, 
+        task=state.get('task_queue', ''), plan=state.get('plan', ''), feedback=feedback))
     result = response.content
-    return {"reflection":result}
+    return {"reflection": result}
       
 def final_response(state: AgentState):
-    response = llm.invoke(final_prompt(state['reflection']))
+    response = llm.invoke(format_prompt(final_prompt, context=state['reflection']))
     result = response.content
-
-    return {"status":result}
+    return {"status": result}
      
 # conditional 
 def route_task(state):
-    t = state['current_task']
-    return 'research' if t['type'] == 'research' else 'coding'
+    return state['current_task']
 
 def route_safety(state):
     """Routes based on safety_flags set by the safety_check node."""
     return 'human' if state['safety_flags'] == 'needs_human' else 'execute'
 
 def route_verification(state):
-    return 'review' if state['verification']=="success" else 'error_analyzer'
+    return 'review' if state['verification'] == "success" else 'error_analyzer'
 
 def route_reflection(state):
-    if state['status'] == 'failed' and state.get('retry_local'):
-        return 'coding'        # minor fix, retry in place
-    if state['status'] == 'failed':
-        return 'planner'       # fundamental issue, re-plan
-    if state['task_queue']:
-        return 'task_queue'    # more work to do
-    return 'final_response'    # done
+    status = state.get('status', '').strip().lower()
+    if 'retry_task' in status:
+        return 'coding'
+    if 'replan' in status:
+        return 'planner'
+    if 'next_task' in status:
+        return 'task_queue'
+    return 'done'
 
 
 g = StateGraph(AgentState)
@@ -188,10 +229,11 @@ g.add_edge('merge', 'safety')
 # safety + execution
 g.add_conditional_edges('safety', route_safety,
     {'human': 'human', 'execute': 'execute'})
-g.add_edge('human', 'execute') 
-g.add_conditional_edges('execute',tools_condition)
+
+g.add_conditional_edges('execute', tools_condition,
+    {"tools": "tool_node", "__end__": "verify"})
 g.add_edge('tool_node', 'execute')
-g.add_edge('execute', 'verify')
+
 # verify branch
 g.add_conditional_edges('verify', route_verification,
     {'review': 'review', 'error_analyzer': 'error_analyzer'})
@@ -199,14 +241,14 @@ g.add_edge('error_analyzer', 'reflect')
 g.add_edge('review', 'reflect')
 
 # reflection loop
-g.add_conditional_edges('reflect', route_reflection,
+g.add_edge('reflect', 'final')
+g.add_conditional_edges('final', route_reflection,
     {'coding': 'coding', 'planner': 'planner',
-     'task_queue': 'task_queue', 'final_response': 'final'})
-g.add_edge('final', END)
+     'task_queue': 'task_queue', 'done': END})
 memory = InMemorySaver()   
 config = {"configurable": {"thread_id": "user-123"}}
 workflow = g.compile(checkpointer=memory)
 
-inputs = {"user_request": "write a code to add two numbers"}
+inputs = {"user_request": "make a folder named 'quadratic_project' and inside of that folder make a file named 'solver.py', and inside of that file write python code to solve a quadratic equation. Make sure to use tools to create the folder and file."}
 for output in workflow.stream(inputs, config=config, stream_mode="values"):
     print(output)
