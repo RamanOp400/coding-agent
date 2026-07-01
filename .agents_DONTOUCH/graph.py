@@ -12,6 +12,7 @@ from prompt import *
 import operator
 import sys
 import io
+
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 def format_prompt(template: str, **kwargs) -> str:
@@ -167,7 +168,27 @@ def reflection(state: AgentState):
 def final_response(state: AgentState):
     response = llm.invoke(format_prompt(final_prompt, context=state['reflection']))
     result = response.content
-    return {"status": result}
+    
+    # Extract just the status keyword from the LLM's verbose response.
+    # The LLM returns a full report but we only need the final keyword.
+    import re
+    result_lower = result.strip().lower()
+    
+    # Look for the keyword in common formats the LLM uses:
+    # "status: done", "status: \"done\"", "```\ndone\n```", etc.
+    valid_statuses = ['done', 'failed', 'next_task', 'retry_task', 'replan']
+    
+    # Strategy: find the LAST occurrence of any valid status keyword
+    last_match = None
+    last_pos = -1
+    for kw in valid_statuses:
+        pos = result_lower.rfind(kw)
+        if pos > last_pos:
+            last_pos = pos
+            last_match = kw
+    
+    extracted = last_match if last_match else 'done'
+    return {"status": extracted}
      
 # conditional 
 def route_task(state):
@@ -182,12 +203,13 @@ def route_verification(state):
 
 def route_reflection(state):
     status = state.get('status', '').strip().lower()
-    if 'retry_task' in status:
+    if status == 'retry_task':
         return 'coding'
-    if 'replan' in status:
+    elif status == 'replan':
         return 'planner'
-    if 'next_task' in status:
+    elif status == 'next_task':
         return 'task_queue'
+    # 'done', 'failed', or anything unexpected → end the workflow
     return 'done'
 
 
@@ -221,7 +243,6 @@ g.add_edge('planner', 'task_queue')
 # task routing
 g.add_conditional_edges('task_queue', route_task,
     {'research': 'research', 'coding': 'coding'})
-# after research/coding → merge results into unified context → then safety check
 g.add_edge('research', 'merge')
 g.add_edge('coding', 'merge')
 g.add_edge('merge', 'safety')
@@ -249,6 +270,7 @@ memory = InMemorySaver()
 config = {"configurable": {"thread_id": "user-123"}}
 workflow = g.compile(checkpointer=memory)
 
-inputs = {"user_request": "make a folder named 'quadratic_project' and inside of that folder make a file named 'solver.py', and inside of that file write python code to solve a quadratic equation. Make sure to use tools to create the folder and file."}
-for output in workflow.stream(inputs, config=config, stream_mode="values"):
-    print(output)
+if __name__ == "__main__":
+    inputs = {"user_request": "make a folder named 'quadratic_project' and inside of that folder make a file named 'solver.py', and inside of that file write python code to solve a quadratic equation. Make sure to use tools to create the folder and file. and also make it UI in html and css and in java script so i can use it in my local host make sure u use seperated file and folder so i can undersatnd code easily "}
+    for output in workflow.stream(inputs, config=config, stream_mode="values"):
+        print(output)
